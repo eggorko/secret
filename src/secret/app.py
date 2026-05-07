@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 
@@ -197,11 +199,60 @@ class AddRecordScreen(ModalScreen[Record | None]):
         self.dismiss(Record(name=name, value=value))
 
 
+class ConfirmScreen(ModalScreen[bool]):
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        ("left", "focus_cancel", "Cancel"),
+        ("right", "focus_confirm", "Confirm"),
+        ("enter", "apply_selected", "Apply"),
+    ]
+
+    def __init__(self, title: str, message: str, confirm_label: str = "Confirm") -> None:
+        super().__init__()
+        self._title = title
+        self._message = message
+        self._confirm_label = confirm_label
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Static(self._message, id="confirm-message")
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Cancel", id="cancel-confirm", variant="default")
+                yield Button(self._confirm_label, id="accept-confirm", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#confirm-dialog").border_title = self._title
+        self.query_one("#cancel-confirm", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel-confirm":
+            self.action_cancel()
+        elif event.button.id == "accept-confirm":
+            self.dismiss(True)
+
+    def action_focus_cancel(self) -> None:
+        self.query_one("#cancel-confirm", Button).focus()
+
+    def action_focus_confirm(self) -> None:
+        self.query_one("#accept-confirm", Button).focus()
+
+    def action_apply_selected(self) -> None:
+        focused_id = getattr(self.focused, "id", None)
+        if focused_id == "accept-confirm":
+            self.dismiss(True)
+        else:
+            self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class MainScreen(Screen):
     BINDINGS = [
-        ("ctrl+n", "add_record", "Add Record"),
-        ("ctrl+r", "reveal_value", "Reveal Value"),
-        ("ctrl+d", "delete_record", "Delete Record"),
+        ("n", "add_record", "Add Record"),
+        ("c", "buffer_secret", "Copy Value"),
+        ("r", "reveal_value", "Reveal Value"),
+        ("d", "delete_record", "Delete Record"),
         ("ctrl+q", "quit", "Quit"),
     ]
 
@@ -235,7 +286,7 @@ class MainScreen(Screen):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "add_record":
             return isinstance(self.focused, ListView)
-        if action in ("reveal_value", "reveal_record", "delete_record"):
+        if action in ("reveal_value", "reveal_record", "buffer_secret", "delete_record"):
             return self._selected_index is not None
         return True
 
@@ -261,20 +312,71 @@ class MainScreen(Screen):
             return
 
         record = self._records[index]
-        name_widget.update(f"[#8892b5]name [/]  {record.name}")
+        name_widget.update(f"[#8892b5]Name: [/]  {record.name}")
         if self._value_visible:
-            value_widget.update(f"[#8892b5]value[/]  {record.value}")
+            value_widget.update(f"[#8892b5]Secret:[/]  {record.value}")
         else:
-            value_widget.update(f"[#8892b5]value[/]  {'•' * len(record.value)}")
+            value_widget.update(f"[#8892b5]Secret:[/]  {'•' * len(record.value)}")
 
     def action_reveal_value(self) -> None:
         if self._selected_index is not None:
             self._value_visible = not self._value_visible
             self._refresh_detail()
 
+    def action_buffer_secret(self) -> None:
+        index = self._selected_index
+        if index is None or index >= len(self._records):
+            return
+
+        if self._copy_to_system_buffer(self._records[index].value):
+            self.app.notify("Secret copied to system buffer.")
+        else:
+            self.app.notify("Could not copy secret to system buffer.", severity="error")
+
+    def _copy_to_system_buffer(self, value: str) -> bool:
+        self.app.copy_to_clipboard(value)
+
+        commands = [
+            ("pbcopy", []),
+            ("wl-copy", []),
+            ("xclip", ["-selection", "clipboard"]),
+            ("xsel", ["--clipboard", "--input"]),
+            ("clip.exe", []),
+        ]
+        for command, args in commands:
+            executable = shutil.which(command)
+            if executable is None:
+                continue
+            try:
+                subprocess.run(
+                    [executable, *args],
+                    input=value,
+                    text=True,
+                    check=True,
+                )
+            except (OSError, subprocess.CalledProcessError):
+                continue
+            return True
+
+        return False
+
     def action_delete_record(self) -> None:
         index = self._selected_index
         if index is None or index >= len(self._records):
+            return
+
+        record = self._records[index]
+        self.app.push_screen(
+            ConfirmScreen(
+                title="Delete Record",
+                message=f'Delete "{record.name}"? This cannot be undone.',
+                confirm_label="Delete",
+            ),
+            callback=lambda confirmed: self._delete_record_at(index) if confirmed else None,
+        )
+
+    def _delete_record_at(self, index: int) -> None:
+        if index >= len(self._records):
             return
 
         list_view = self.query_one("#record-list", ListView)
