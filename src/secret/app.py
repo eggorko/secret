@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import math
+import time
 from dataclasses import dataclass
 
 from cryptography.fernet import InvalidToken
 from textual.app import App, ComposeResult
+from textual.command import Hit, Hits, Provider
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Footer, Input, Label, ListItem, ListView, Static
@@ -18,12 +21,22 @@ class Record:
     value: str
 
 
+class DetailPanel(Vertical):
+    can_focus = True
+
 class UnlockScreen(Screen):
     BINDINGS = [("escape", "quit", "Quit")]
+
+    GRACE_ATTEMPTS = 2
+    COOLDOWN_BASE_S = 5
+    COOLDOWN_MAX_S = 300
 
     def __init__(self, is_new: bool) -> None:
         super().__init__()
         self._is_new = is_new
+        self._wrong_attempts = 0
+        self._locked_until = 0.0
+        self._tick_timer = None
 
     def compose(self) -> ComposeResult:
         button_label = "Create" if self._is_new else "Unlock"
@@ -59,6 +72,9 @@ class UnlockScreen(Screen):
         self.app.exit()
 
     def _submit(self) -> None:
+        if self._cooldown_remaining() > 0:
+            return
+
         password = self.query_one("#unlock-password", Input).value
         error = self.query_one("#unlock-error", Static)
 
@@ -79,12 +95,54 @@ class UnlockScreen(Screen):
             try:
                 records = [Record(**r) for r in storage.load_records(password)]
             except InvalidToken:
-                error.update("Wrong password.")
-                self.query_one("#unlock-password", Input).clear()
-                self.query_one("#unlock-password", Input).focus()
+                self._handle_wrong_password()
                 return
+            self._wrong_attempts = 0
 
+        storage.save_session(password)
         self.app.switch_screen(MainScreen(records=records, master_password=password))
+
+    def _handle_wrong_password(self) -> None:
+        self._wrong_attempts += 1
+        password_input = self.query_one("#unlock-password", Input)
+        password_input.clear()
+
+        if self._wrong_attempts > self.GRACE_ATTEMPTS:
+            self._start_cooldown()
+        else:
+            error = self.query_one("#unlock-error", Static)
+            remaining = self.GRACE_ATTEMPTS - self._wrong_attempts + 1
+            error.update(f"Wrong password. {remaining} attempt(s) before cooldown.")
+            password_input.focus()
+
+    def _start_cooldown(self) -> None:
+        excess = self._wrong_attempts - self.GRACE_ATTEMPTS
+        delay = min(self.COOLDOWN_MAX_S, self.COOLDOWN_BASE_S * (2 ** (excess - 1)))
+        self._locked_until = time.monotonic() + delay
+
+        self.query_one("#unlock-password", Input).disabled = True
+        self.query_one("#submit-unlock", Button).disabled = True
+        self._tick_cooldown()
+        if self._tick_timer is None:
+            self._tick_timer = self.set_interval(1.0, self._tick_cooldown)
+
+    def _tick_cooldown(self) -> None:
+        remaining = self._cooldown_remaining()
+        error = self.query_one("#unlock-error", Static)
+        if remaining > 0:
+            error.update(f"Locked. Try again in {remaining}s.")
+            return
+
+        if self._tick_timer is not None:
+            self._tick_timer.stop()
+            self._tick_timer = None
+        self.query_one("#unlock-password", Input).disabled = False
+        self.query_one("#submit-unlock", Button).disabled = False
+        self.query_one("#unlock-password", Input).focus()
+        error.update("")
+
+    def _cooldown_remaining(self) -> int:
+        return max(0, math.ceil(self._locked_until - time.monotonic()))
 
 
 class AddRecordScreen(ModalScreen[Record | None]):
@@ -142,6 +200,7 @@ class AddRecordScreen(ModalScreen[Record | None]):
 class MainScreen(Screen):
     BINDINGS = [
         ("ctrl+n", "add_record", "Add Record"),
+        ("ctrl+r", "reveal_value", "Reveal Value"),
         ("ctrl+d", "delete_record", "Delete Record"),
         ("ctrl+q", "quit", "Quit"),
     ]
@@ -156,52 +215,62 @@ class MainScreen(Screen):
     def compose(self) -> ComposeResult:
         with Horizontal(id="main-layout"):
             with Vertical(id="record-panel"):
-                yield ListView(id="record-list")
-            with Vertical(id="detail-panel"):
+                yield ListView(
+                    *(ListItem(Label(record.name)) for record in self._records),
+                    id="record-list",
+                    initial_index=0 if self._records else None,
+                )
+            with DetailPanel(id="detail-panel"):
                 yield Static("Select a record", id="detail-name")
                 yield Static("", id="detail-value")
-                yield Button("Show", id="toggle-value")
         yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#record-panel").border_title = "Records"
         self.query_one("#detail-panel").border_title = "Details"
         list_view = self.query_one("#record-list", ListView)
-        for record in self._records:
-            list_view.append(ListItem(Label(record.name)))
-        self.query_one("#toggle-value", Button).display = False
-
-    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        self._selected_index = self.query_one("#record-list", ListView).index
-        self._value_visible = False
+        self._set_selected_index(list_view.index)
         self._refresh_detail()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "toggle-value":
-            self._value_visible = not self._value_visible
-            self._refresh_detail()
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "add_record":
+            return isinstance(self.focused, ListView)
+        if action in ("reveal_value", "reveal_record", "delete_record"):
+            return self._selected_index is not None
+        return True
+
+    def _set_selected_index(self, index: int | None) -> None:
+        if self._selected_index == index:
+            return
+        self._selected_index = index
+        self.refresh_bindings()
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        self._set_selected_index(self.query_one("#record-list", ListView).index)
+        self._value_visible = False
+        self._refresh_detail()
 
     def _refresh_detail(self) -> None:
         name_widget = self.query_one("#detail-name", Static)
         value_widget = self.query_one("#detail-value", Static)
-        toggle_btn = self.query_one("#toggle-value", Button)
 
         index = self._selected_index
         if index is None or index >= len(self._records):
-            name_widget.update("Select a record to view details")
+            name_widget.update("Select a record")
             value_widget.update("")
-            toggle_btn.display = False
             return
 
         record = self._records[index]
         name_widget.update(f"[#8892b5]name [/]  {record.name}")
         if self._value_visible:
             value_widget.update(f"[#8892b5]value[/]  {record.value}")
-            toggle_btn.label = "hide"
         else:
             value_widget.update(f"[#8892b5]value[/]  {'•' * len(record.value)}")
-            toggle_btn.label = "show"
-        toggle_btn.display = True
+
+    def action_reveal_value(self) -> None:
+        if self._selected_index is not None:
+            self._value_visible = not self._value_visible
+            self._refresh_detail()
 
     def action_delete_record(self) -> None:
         index = self._selected_index
@@ -217,9 +286,9 @@ class MainScreen(Screen):
         )
 
         if not self._records:
-            self._selected_index = None
+            self._set_selected_index(None)
         elif index >= len(self._records):
-            self._selected_index = len(self._records) - 1
+            self._set_selected_index(len(self._records) - 1)
             list_view.index = self._selected_index
 
         self._value_visible = False
@@ -232,7 +301,12 @@ class MainScreen(Screen):
         if record is None:
             return
         self._records.append(record)
-        self.query_one("#record-list", ListView).append(ListItem(Label(record.name)))
+        list_view = self.query_one("#record-list", ListView)
+        list_view.append(ListItem(Label(record.name)))
+        if self._selected_index is None:
+            list_view.index = 0
+            self._set_selected_index(list_view.index)
+            self._refresh_detail()
         storage.save_records(
             self._master_password,
             [{"name": r.name, "value": r.value} for r in self._records],
@@ -244,11 +318,26 @@ class MainScreen(Screen):
 
 class SecretApp(App):
     CSS_PATH = "app.tcss"
-    ENABLE_COMMAND_PALETTE = False
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
         self.args = args
 
     def on_mount(self) -> None:
-        self.push_screen(UnlockScreen(is_new=not storage.vault_exists()))
+        if not storage.vault_exists():
+            storage.clear_session()
+            self.push_screen(UnlockScreen(is_new=True))
+            return
+
+        cached_password = storage.load_session()
+        if cached_password is not None:
+            try:
+                records = [Record(**r) for r in storage.load_records(cached_password)]
+            except InvalidToken:
+                storage.clear_session()
+            else:
+                storage.save_session(cached_password)
+                self.push_screen(MainScreen(records=records, master_password=cached_password))
+                return
+
+        self.push_screen(UnlockScreen(is_new=False))
