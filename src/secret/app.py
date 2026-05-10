@@ -21,6 +21,18 @@ from secret import storage
 class Record:
     name: str
     secret: str
+    type: str = "SimpleCredentials"
+    url: str | None = None
+    login: str | None = None
+
+    def as_payload(self) -> dict[str, str | None]:
+        return {
+            "name": self.name,
+            "type": self.type,
+            "url": self.url,
+            "login": self.login,
+            "secret": self.secret,
+        }
 
 
 class DetailPanel(Vertical):
@@ -162,6 +174,18 @@ class AddRecordScreen(ModalScreen[Record | None]):
                 placeholder="Record name",
                 value=self._record.name if self._record else "",
             )
+            yield Label("URL", classes="field-label")
+            yield Input(
+                id="record-url",
+                placeholder="URL",
+                value=(self._record.url or "") if self._record else "",
+            )
+            yield Label("Login", classes="field-label")
+            yield Input(
+                id="record-login",
+                placeholder="Login",
+                value=(self._record.login or "") if self._record else "",
+            )
             yield Label("Value", classes="field-label")
             with Horizontal(id="record-value-row"):
                 yield Input(
@@ -187,6 +211,10 @@ class AddRecordScreen(ModalScreen[Record | None]):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "record-name":
+            self.query_one("#record-url", Input).focus()
+        elif event.input.id == "record-url":
+            self.query_one("#record-login", Input).focus()
+        elif event.input.id == "record-login":
             self.query_one("#record-value", Input).focus()
         else:
             self._save_record()
@@ -211,8 +239,12 @@ class AddRecordScreen(ModalScreen[Record | None]):
 
     def _save_record(self) -> None:
         name_input = self.query_one("#record-name", Input)
+        url_input = self.query_one("#record-url", Input)
+        login_input = self.query_one("#record-login", Input)
         value_input = self.query_one("#record-value", Input)
         name = name_input.value.strip()
+        url = url_input.value.strip() or None
+        login = login_input.value.strip() or None
         value = value_input.value
         error = self.query_one("#record-error", Static)
 
@@ -225,7 +257,7 @@ class AddRecordScreen(ModalScreen[Record | None]):
             value_input.focus()
             return
 
-        self.dismiss(Record(name=name, secret=value))
+        self.dismiss(Record(name=name, url=url, login=login, secret=value))
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -350,6 +382,11 @@ class MainScreen(Screen):
 
         record = self._records[index]
         name_widget.update(f"[#8892b5]Name: [/]  {record.name}")
+        details: list[str] = []
+        if record.url:
+            details.append(f"[#8892b5]URL:[/]  {record.url}")
+        if record.login:
+            details.append(f"[#8892b5]Login:[/]  {record.login}")
         if self._value_visible:
             try:
                 secret = storage.decrypt_secret(self._master_password, record.secret)
@@ -358,9 +395,10 @@ class MainScreen(Screen):
                 value_widget.update("[#8892b5]Secret:[/]  Could not decrypt secret")
                 self.app.notify("Could not decrypt secret.", severity="error")
                 return
-            value_widget.update(f"[#8892b5]Secret:[/]  {secret}")
+            details.append(f"[#8892b5]Secret:[/]  {secret}")
         else:
-            value_widget.update(f"[#8892b5]Secret:[/]  {'•' * 12}")
+            details.append(f"[#8892b5]Secret:[/]  {'•' * 12}")
+        value_widget.update("\n".join(details))
 
     def action_reveal_value(self) -> None:
         if self._selected_index is not None:
@@ -434,7 +472,7 @@ class MainScreen(Screen):
         self._records.pop(index)
         storage.save_records(
             self._master_password,
-            [{"name": r.name, "secret": r.secret} for r in self._records],
+            [r.as_payload() for r in self._records],
         )
 
         if not self._records:
@@ -461,7 +499,13 @@ class MainScreen(Screen):
             self.app.notify("Could not decrypt secret.", severity="error")
             return
 
-        editable_record = Record(name=record.name, secret=secret)
+        editable_record = Record(
+            name=record.name,
+            type=record.type,
+            url=record.url,
+            login=record.login,
+            secret=secret,
+        )
         self.app.push_screen(
             AddRecordScreen(record=editable_record),
             callback=lambda updated: self._record_edited_at(index, updated),
@@ -469,7 +513,7 @@ class MainScreen(Screen):
 
     def action_dump_records(self) -> None:
         path = storage.dump_records([
-            {"name": record.name, "secret": record.secret}
+            record.as_payload()
             for record in self._records
         ])
         self.app.notify(f"Records dumped to {path}.")
@@ -479,6 +523,9 @@ class MainScreen(Screen):
             return
         encrypted_record = Record(
             name=record.name,
+            type=record.type,
+            url=record.url,
+            login=record.login,
             secret=storage.encrypt_secret(self._master_password, record.secret),
         )
         self._records.append(encrypted_record)
@@ -490,7 +537,7 @@ class MainScreen(Screen):
             self._refresh_detail()
         storage.save_records(
             self._master_password,
-            [{"name": r.name, "secret": r.secret} for r in self._records],
+            [r.as_payload() for r in self._records],
         )
 
     def _record_edited_at(self, index: int, record: Record | None) -> None:
@@ -499,6 +546,9 @@ class MainScreen(Screen):
 
         encrypted_record = Record(
             name=record.name,
+            type=record.type,
+            url=record.url,
+            login=record.login,
             secret=storage.encrypt_secret(self._master_password, record.secret),
         )
         self._records[index] = encrypted_record
@@ -509,7 +559,7 @@ class MainScreen(Screen):
 
         storage.save_records(
             self._master_password,
-            [{"name": r.name, "secret": r.secret} for r in self._records],
+            [r.as_payload() for r in self._records],
         )
         self._value_visible = False
         self._refresh_detail()
