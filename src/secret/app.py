@@ -150,19 +150,39 @@ class UnlockScreen(Screen):
 class AddRecordScreen(ModalScreen[Record | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
 
+    def __init__(self, record: Record | None = None) -> None:
+        super().__init__()
+        self._record = record
+
     def compose(self) -> ComposeResult:
         with Vertical(id="add-record-dialog"):
             yield Label("Name", classes="field-label")
-            yield Input(id="record-name", placeholder="Record name")
+            yield Input(
+                id="record-name",
+                placeholder="Record name",
+                value=self._record.name if self._record else "",
+            )
             yield Label("Value", classes="field-label")
-            yield Input(id="record-value", placeholder="Record value", password=True)
+            with Horizontal(id="record-value-row"):
+                yield Input(
+                    id="record-value",
+                    placeholder="Record value",
+                    password=True,
+                    value=self._record.secret if self._record else "",
+                )
+                yield Button("*", id="toggle-record-value", variant="default")
             yield Static("", id="record-error")
             with Horizontal(id="record-buttons"):
                 yield Button("Cancel", id="cancel-record", variant="default")
-                yield Button("Add", id="save-record", variant="primary")
+                yield Button(
+                    "Save" if self._record else "Add",
+                    id="save-record",
+                    variant="primary",
+                )
 
     def on_mount(self) -> None:
-        self.query_one("#add-record-dialog").border_title = "Add Record"
+        title = "Edit Record" if self._record else "Add Record"
+        self.query_one("#add-record-dialog").border_title = title
         self.query_one("#record-name", Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -176,9 +196,18 @@ class AddRecordScreen(ModalScreen[Record | None]):
             self.action_cancel()
         elif event.button.id == "save-record":
             self._save_record()
+        elif event.button.id == "toggle-record-value":
+            self._toggle_value_visibility()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    def _toggle_value_visibility(self) -> None:
+        value_input = self.query_one("#record-value", Input)
+        toggle_button = self.query_one("#toggle-record-value", Button)
+        value_input.password = not value_input.password
+        toggle_button.label = "👁"
+        value_input.focus()
 
     def _save_record(self) -> None:
         name_input = self.query_one("#record-name", Input)
@@ -250,6 +279,7 @@ class ConfirmScreen(ModalScreen[bool]):
 class MainScreen(Screen):
     BINDINGS = [
         ("n", "add_record", "Add Record"),
+        ("e", "edit_record", "Edit Record"),
         ("c", "buffer_secret", "Copy Value"),
         ("r", "reveal_value", "Reveal Value"),
         ("d", "delete_record", "Delete Record"),
@@ -287,7 +317,13 @@ class MainScreen(Screen):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "add_record":
             return isinstance(self.focused, ListView)
-        if action in ("reveal_value", "reveal_record", "buffer_secret", "delete_record"):
+        if action in (
+            "reveal_value",
+            "reveal_record",
+            "buffer_secret",
+            "delete_record",
+            "edit_record",
+        ):
             return self._selected_index is not None
         return True
 
@@ -413,6 +449,24 @@ class MainScreen(Screen):
     def action_add_record(self) -> None:
         self.app.push_screen(AddRecordScreen(), callback=self._record_added)
 
+    def action_edit_record(self) -> None:
+        index = self._selected_index
+        if index is None or index >= len(self._records):
+            return
+
+        record = self._records[index]
+        try:
+            secret = storage.decrypt_secret(self._master_password, record.secret)
+        except InvalidToken:
+            self.app.notify("Could not decrypt secret.", severity="error")
+            return
+
+        editable_record = Record(name=record.name, secret=secret)
+        self.app.push_screen(
+            AddRecordScreen(record=editable_record),
+            callback=lambda updated: self._record_edited_at(index, updated),
+        )
+
     def action_dump_records(self) -> None:
         path = storage.dump_records([
             {"name": record.name, "secret": record.secret}
@@ -438,6 +492,27 @@ class MainScreen(Screen):
             self._master_password,
             [{"name": r.name, "secret": r.secret} for r in self._records],
         )
+
+    def _record_edited_at(self, index: int, record: Record | None) -> None:
+        if record is None or index >= len(self._records):
+            return
+
+        encrypted_record = Record(
+            name=record.name,
+            secret=storage.encrypt_secret(self._master_password, record.secret),
+        )
+        self._records[index] = encrypted_record
+
+        list_view = self.query_one("#record-list", ListView)
+        list_item = list(list_view.query(ListItem))[index]
+        list_item.query_one(Label).update(encrypted_record.name)
+
+        storage.save_records(
+            self._master_password,
+            [{"name": r.name, "secret": r.secret} for r in self._records],
+        )
+        self._value_visible = False
+        self._refresh_detail()
 
     def action_quit(self) -> None:
         self.app.exit()
