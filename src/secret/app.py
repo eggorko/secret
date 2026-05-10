@@ -20,7 +20,7 @@ from secret import storage
 @dataclass(frozen=True)
 class Record:
     name: str
-    value: str
+    secret: str
 
 
 class DetailPanel(Vertical):
@@ -196,7 +196,7 @@ class AddRecordScreen(ModalScreen[Record | None]):
             value_input.focus()
             return
 
-        self.dismiss(Record(name=name, value=value))
+        self.dismiss(Record(name=name, secret=value))
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -253,6 +253,7 @@ class MainScreen(Screen):
         ("c", "buffer_secret", "Copy Value"),
         ("r", "reveal_value", "Reveal Value"),
         ("d", "delete_record", "Delete Record"),
+        ("f12", "dump_records", "Dump Records"),
         ("ctrl+q", "quit", "Quit"),
     ]
 
@@ -314,9 +315,16 @@ class MainScreen(Screen):
         record = self._records[index]
         name_widget.update(f"[#8892b5]Name: [/]  {record.name}")
         if self._value_visible:
-            value_widget.update(f"[#8892b5]Secret:[/]  {record.value}")
+            try:
+                secret = storage.decrypt_secret(self._master_password, record.secret)
+            except InvalidToken:
+                self._value_visible = False
+                value_widget.update("[#8892b5]Secret:[/]  Could not decrypt secret")
+                self.app.notify("Could not decrypt secret.", severity="error")
+                return
+            value_widget.update(f"[#8892b5]Secret:[/]  {secret}")
         else:
-            value_widget.update(f"[#8892b5]Secret:[/]  {'•' * len(record.value)}")
+            value_widget.update(f"[#8892b5]Secret:[/]  {'•' * 12}")
 
     def action_reveal_value(self) -> None:
         if self._selected_index is not None:
@@ -328,7 +336,13 @@ class MainScreen(Screen):
         if index is None or index >= len(self._records):
             return
 
-        if self._copy_to_system_buffer(self._records[index].value):
+        try:
+            secret = storage.decrypt_secret(self._master_password, self._records[index].secret)
+        except InvalidToken:
+            self.app.notify("Could not decrypt secret.", severity="error")
+            return
+
+        if self._copy_to_system_buffer(secret):
             self.app.notify("Secret copied to system buffer.")
         else:
             self.app.notify("Could not copy secret to system buffer.", severity="error")
@@ -384,7 +398,7 @@ class MainScreen(Screen):
         self._records.pop(index)
         storage.save_records(
             self._master_password,
-            [{"name": r.name, "value": r.value} for r in self._records],
+            [{"name": r.name, "secret": r.secret} for r in self._records],
         )
 
         if not self._records:
@@ -399,19 +413,30 @@ class MainScreen(Screen):
     def action_add_record(self) -> None:
         self.app.push_screen(AddRecordScreen(), callback=self._record_added)
 
+    def action_dump_records(self) -> None:
+        path = storage.dump_records([
+            {"name": record.name, "secret": record.secret}
+            for record in self._records
+        ])
+        self.app.notify(f"Records dumped to {path}.")
+
     def _record_added(self, record: Record | None) -> None:
         if record is None:
             return
-        self._records.append(record)
+        encrypted_record = Record(
+            name=record.name,
+            secret=storage.encrypt_secret(self._master_password, record.secret),
+        )
+        self._records.append(encrypted_record)
         list_view = self.query_one("#record-list", ListView)
-        list_view.append(ListItem(Label(record.name)))
+        list_view.append(ListItem(Label(encrypted_record.name)))
         if self._selected_index is None:
             list_view.index = 0
             self._set_selected_index(list_view.index)
             self._refresh_detail()
         storage.save_records(
             self._master_password,
-            [{"name": r.name, "value": r.value} for r in self._records],
+            [{"name": r.name, "secret": r.secret} for r in self._records],
         )
 
     def action_quit(self) -> None:
