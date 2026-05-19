@@ -16,6 +16,8 @@ SESSION_PATH = Path.home() / ".cache" / "secret" / "session.json"
 DEBUG_DUMP_PATH = Path.home() / ".cache" / "secret" / "records-debug.json"
 SESSION_TTL_S = 15 * 60
 VAULT_VERSION = 2
+RecordPayload = dict[str, str | None]
+LegacyRecordPayload = dict[str, str | None]
 
 
 def _derive_key(password: str, salt: bytes) -> bytes:
@@ -32,7 +34,7 @@ def vault_exists() -> bool:
     return VAULT_PATH.exists()
 
 
-def load_records(password: str) -> list[dict[str, str]]:
+def load_records(password: str) -> list[RecordPayload]:
     """Raises InvalidToken if the password is wrong."""
     raw = json.loads(VAULT_PATH.read_text())
     plaintext = _decrypt_vault_payload(password, raw)
@@ -43,7 +45,7 @@ def load_records(password: str) -> list[dict[str, str]]:
     return records
 
 
-def save_records(password: str, records: list[dict[str, str]]) -> None:
+def save_records(password: str, records: list[RecordPayload | LegacyRecordPayload]) -> None:
     if vault_exists():
         raw = json.loads(VAULT_PATH.read_text())
         outer_salt = base64.b64decode(raw["salt"])
@@ -83,7 +85,7 @@ def decrypt_secret(password: str, token: str) -> str:
     return plaintext.decode()
 
 
-def dump_records(records: list[dict[str, str]]) -> Path:
+def dump_records(records: list[RecordPayload]) -> Path:
     DEBUG_DUMP_PATH.parent.mkdir(parents=True, exist_ok=True)
     DEBUG_DUMP_PATH.write_text(json.dumps({
         "dumped_at": datetime.now(timezone.utc).isoformat(),
@@ -108,27 +110,37 @@ def _needs_secret_migration(raw: dict[str, object], records: object) -> bool:
     if not isinstance(records, list):
         return False
     return raw.get("version") != VAULT_VERSION or any(
-        isinstance(record, dict) and "value" in record for record in records
+        isinstance(record, dict)
+        and ("value" in record or "type" not in record)
+        for record in records
     )
 
 
 def _normalize_records_for_save(
     password: str,
-    records: list[dict[str, str]],
+    records: list[RecordPayload | LegacyRecordPayload],
     inner_salt: bytes,
-) -> list[dict[str, str]]:
-    normalized_records: list[dict[str, str]] = []
+) -> list[RecordPayload]:
+    normalized_records: list[RecordPayload] = []
     for record in records:
         if "secret" in record:
-            normalized_records.append({"name": record["name"], "secret": record["secret"]})
-        elif "value" in record:
-            normalized_records.append({
-                "name": record["name"],
+            normalized_records.append(_normalize_record(record))
+        elif isinstance(record.get("value"), str):
+            normalized_records.append(_normalize_record({
+                **record,
                 "secret": _encrypt_secret_with_salt(password, inner_salt, record["value"]),
-            })
-        else:
-            normalized_records.append(record)
+            }))
     return normalized_records
+
+
+def _normalize_record(record: RecordPayload) -> RecordPayload:
+    return {
+        "name": record["name"],
+        "type": record.get("type") or "SimpleCredentials",
+        "url": record.get("url") or None,
+        "login": record.get("login") or None,
+        "secret": record["secret"],
+    }
 
 
 def _encrypt_secret_with_salt(password: str, salt: bytes, value: str) -> str:
