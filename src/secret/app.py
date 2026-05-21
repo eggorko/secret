@@ -12,27 +12,97 @@ from textual.app import App, ComposeResult
 from textual.command import Hit, Hits, Provider
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Footer, Input, Label, ListItem, ListView, Static
+from textual.widgets import (
+    Button,
+    Checkbox,
+    Footer,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 
 from secret import storage
+
+
+SIMPLE_TYPE = "SimpleCredentials"
+COMPLEX_TYPE = "ComplexCredentials"
+
+
+@dataclass(frozen=True)
+class Field:
+    """A single labelled entry inside a complex credential."""
+
+    label: str
+    value: str
+    secret: bool = False
+
+    def as_payload(self) -> dict[str, object]:
+        return {"label": self.label, "value": self.value, "secret": self.secret}
+
+    @classmethod
+    def from_payload(cls, data: dict[str, object]) -> "Field":
+        return cls(
+            label=str(data.get("label", "")),
+            value=str(data.get("value", "")),
+            secret=bool(data.get("secret", False)),
+        )
 
 
 @dataclass(frozen=True)
 class Record:
     name: str
-    secret: str
-    type: str = "SimpleCredentials"
+    secret: str = ""
+    type: str = SIMPLE_TYPE
     url: str | None = None
     login: str | None = None
+    tag: str = "NULL"
+    label: str = "General"
+    fields: tuple[Field, ...] = ()
 
-    def as_payload(self) -> dict[str, str | None]:
+    @property
+    def is_complex(self) -> bool:
+        return self.type == COMPLEX_TYPE
+
+    def as_payload(self) -> dict[str, object]:
+        if self.is_complex:
+            return {
+                "name": self.name,
+                "type": self.type,
+                "tag": self.tag,
+                "label": self.label,
+                "fields": [field.as_payload() for field in self.fields],
+            }
         return {
             "name": self.name,
             "type": self.type,
+            "tag": self.tag,
+            "label": self.label,
             "url": self.url,
             "login": self.login,
             "secret": self.secret,
         }
+
+    @classmethod
+    def from_payload(cls, data: dict[str, object]) -> "Record":
+        raw_fields = data.get("fields") or ()
+        return cls(
+            name=str(data["name"]),
+            secret=str(data.get("secret") or ""),
+            type=str(data.get("type") or SIMPLE_TYPE),
+            url=data.get("url") or None,
+            login=data.get("login") or None,
+            tag=str(data.get("tag") or "NULL"),
+            label=str(data.get("label") or "General"),
+            fields=tuple(
+                Field.from_payload(field)
+                for field in raw_fields
+                if isinstance(field, dict)
+            ),
+        )
 
 
 class DetailPanel(Vertical):
@@ -107,7 +177,7 @@ class UnlockScreen(Screen):
             records: list[Record] = []
         else:
             try:
-                records = [Record(**r) for r in storage.load_records(password)]
+                records = [Record.from_payload(r) for r in storage.load_records(password)]
             except InvalidToken:
                 self._handle_wrong_password()
                 return
@@ -159,6 +229,47 @@ class UnlockScreen(Screen):
         return max(0, math.ceil(self._locked_until - time.monotonic()))
 
 
+class ComplexFieldRow(Horizontal):
+    """A single editable label/value/secret row in the complex builder."""
+
+    def __init__(self, label: str = "", value: str = "", secret: bool = False) -> None:
+        super().__init__(classes="complex-field-row")
+        self._initial_label = label
+        self._initial_value = value
+        self._initial_secret = secret
+
+    def compose(self) -> ComposeResult:
+        yield Input(
+            value=self._initial_label,
+            placeholder="Label",
+            classes="field-label-input",
+        )
+        yield Input(
+            value=self._initial_value,
+            placeholder="Value",
+            password=self._initial_secret,
+            classes="field-value-input",
+        )
+        yield Checkbox("Secret", value=self._initial_secret, classes="field-secret-toggle")
+        yield Button("✕", classes="remove-field", variant="default")
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        event.stop()
+        self.query_one(".field-value-input", Input).password = bool(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if "remove-field" in event.button.classes:
+            event.stop()
+            self.remove()
+
+    def to_field(self) -> Field:
+        return Field(
+            label=self.query_one(".field-label-input", Input).value.strip(),
+            value=self.query_one(".field-value-input", Input).value,
+            secret=self.query_one(".field-secret-toggle", Checkbox).value,
+        )
+
+
 class AddRecordScreen(ModalScreen[Record | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
 
@@ -167,57 +278,122 @@ class AddRecordScreen(ModalScreen[Record | None]):
         self._record = record
 
     def compose(self) -> ComposeResult:
+        record = self._record
+        is_simple = record is not None and not record.is_complex
         with Vertical(id="add-record-dialog"):
-            yield Label("Name", classes="field-label")
-            yield Input(
-                id="record-name",
-                placeholder="Record name",
-                value=self._record.name if self._record else "",
-            )
-            yield Label("URL", classes="field-label")
-            yield Input(
-                id="record-url",
-                placeholder="URL",
-                value=(self._record.url or "") if self._record else "",
-            )
-            yield Label("Login", classes="field-label")
-            yield Input(
-                id="record-login",
-                placeholder="Login",
-                value=(self._record.login or "") if self._record else "",
-            )
-            yield Label("Value", classes="field-label")
-            with Horizontal(id="record-value-row"):
-                yield Input(
-                    id="record-value",
-                    placeholder="Record value",
-                    password=True,
-                    value=self._record.secret if self._record else "",
-                )
-                yield Button("*", id="toggle-record-value", variant="default")
+            with TabbedContent(id="record-tabs"):
+                with TabPane("Simple", id="tab-simple"):
+                    yield Label("Name", classes="field-label")
+                    yield Input(
+                        id="record-name",
+                        placeholder="Record name",
+                        value=record.name if is_simple else "",
+                    )
+                    yield Label("Tag", classes="field-label")
+                    yield Input(
+                        id="record-tag",
+                        placeholder="Tag",
+                        value=record.tag if is_simple else "",
+                    )
+                    yield Label("Label (Optional)", classes="field-label")
+                    yield Input(
+                        id="record-label",
+                        placeholder="General",
+                        value=record.label if is_simple else "",
+                    )
+                    yield Label("URL (Optional)", classes="field-label")
+                    yield Input(
+                        id="record-url",
+                        placeholder="URL",
+                        value=(record.url or "") if is_simple else "",
+                    )
+                    yield Label("Login (Optional)", classes="field-label")
+                    yield Input(
+                        id="record-login",
+                        placeholder="Login",
+                        value=(record.login or "") if is_simple else "",
+                    )
+                    yield Label("Value", classes="field-label")
+                    with Horizontal(id="record-value-row"):
+                        yield Input(
+                            id="record-value",
+                            placeholder="Record value",
+                            password=True,
+                            value=record.secret if is_simple else "",
+                        )
+                        yield Button("*", id="toggle-record-value", variant="default")
+                with TabPane("Complex", id="tab-complex"):
+                    yield Label("Name", classes="field-label")
+                    yield Input(
+                        id="complex-name",
+                        placeholder="Record name",
+                        value=record.name if record and record.is_complex else "",
+                    )
+                    yield Label("Tag", classes="field-label")
+                    yield Input(
+                        id="complex-tag",
+                        placeholder="Tag",
+                        value=record.tag if record and record.is_complex else "",
+                    )
+                    yield Label("Label (Optional)", classes="field-label")
+                    yield Input(
+                        id="complex-label",
+                        placeholder="General",
+                        value=record.label if record and record.is_complex else "",
+                    )
+                    yield Vertical(id="complex-fields")
+                    yield Button("+ Add field", id="add-field", variant="default")
             yield Static("", id="record-error")
             with Horizontal(id="record-buttons"):
                 yield Button("Cancel", id="cancel-record", variant="default")
                 yield Button(
-                    "Save" if self._record else "Add",
+                    "Save" if record else "Add",
                     id="save-record",
                     variant="primary",
                 )
 
     def on_mount(self) -> None:
-        title = "Edit Record" if self._record else "Add Record"
-        self.query_one("#add-record-dialog").border_title = title
-        self.query_one("#record-name", Input).focus()
+        dialog = self.query_one("#add-record-dialog")
+        tabs = self.query_one("#record-tabs", TabbedContent)
+        container = self.query_one("#complex-fields")
+        record = self._record
+
+        if record is None:
+            dialog.border_title = "Add Record"
+            container.mount(ComplexFieldRow())
+            self.query_one("#record-name", Input).focus()
+            return
+
+        dialog.border_title = "Edit Record"
+        if record.is_complex:
+            for field in record.fields:
+                container.mount(
+                    ComplexFieldRow(label=field.label, value=field.value, secret=field.secret)
+                )
+            tabs.active = "tab-complex"
+            tabs.disable_tab("tab-simple")
+            self.call_after_refresh(lambda: self.query_one("#complex-name", Input).focus())
+        else:
+            tabs.disable_tab("tab-complex")
+            self.query_one("#record-name", Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "record-name":
+            self.query_one("#record-tag", Input).focus()
+        elif event.input.id == "record-tag":
+            self.query_one("#record-label", Input).focus()
+        elif event.input.id == "record-label":
             self.query_one("#record-url", Input).focus()
         elif event.input.id == "record-url":
             self.query_one("#record-login", Input).focus()
         elif event.input.id == "record-login":
             self.query_one("#record-value", Input).focus()
-        else:
+        elif event.input.id == "record-value":
             self._save_record()
+        elif event.input.id == "complex-name":
+            self.query_one("#complex-tag", Input).focus()
+        elif event.input.id == "complex-tag":
+            self.query_one("#complex-label", Input).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel-record":
@@ -226,9 +402,16 @@ class AddRecordScreen(ModalScreen[Record | None]):
             self._save_record()
         elif event.button.id == "toggle-record-value":
             self._toggle_value_visibility()
+        elif event.button.id == "add-field":
+            self._add_field()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    def _add_field(self) -> None:
+        row = ComplexFieldRow()
+        self.query_one("#complex-fields").mount(row)
+        self.call_after_refresh(lambda: row.query_one(".field-label-input", Input).focus())
 
     def _toggle_value_visibility(self) -> None:
         value_input = self.query_one("#record-value", Input)
@@ -238,26 +421,75 @@ class AddRecordScreen(ModalScreen[Record | None]):
         value_input.focus()
 
     def _save_record(self) -> None:
+        error = self.query_one("#record-error", Static)
+        if self.query_one("#record-tabs", TabbedContent).active == "tab-complex":
+            self._save_complex_record(error)
+        else:
+            self._save_simple_record(error)
+
+    def _save_simple_record(self, error: Static) -> None:
         name_input = self.query_one("#record-name", Input)
-        url_input = self.query_one("#record-url", Input)
-        login_input = self.query_one("#record-login", Input)
+        tag_input = self.query_one("#record-tag", Input)
         value_input = self.query_one("#record-value", Input)
         name = name_input.value.strip()
-        url = url_input.value.strip() or None
-        login = login_input.value.strip() or None
+        tag = tag_input.value.strip()
+        label = self.query_one("#record-label", Input).value.strip() or "General"
+        url = self.query_one("#record-url", Input).value.strip() or None
+        login = self.query_one("#record-login", Input).value.strip() or None
         value = value_input.value
-        error = self.query_one("#record-error", Static)
 
         if not name:
             error.update("Name is required.")
             name_input.focus()
+            return
+        if not tag:
+            error.update("Tag is required.")
+            tag_input.focus()
             return
         if not value:
             error.update("Value is required.")
             value_input.focus()
             return
 
-        self.dismiss(Record(name=name, url=url, login=login, secret=value))
+        self.dismiss(
+            Record(name=name, url=url, login=login, secret=value, tag=tag, label=label)
+        )
+
+    def _save_complex_record(self, error: Static) -> None:
+        name_input = self.query_one("#complex-name", Input)
+        tag_input = self.query_one("#complex-tag", Input)
+        name = name_input.value.strip()
+        tag = tag_input.value.strip()
+        label = self.query_one("#complex-label", Input).value.strip() or "General"
+        if not name:
+            error.update("Name is required.")
+            name_input.focus()
+            return
+        if not tag:
+            error.update("Tag is required.")
+            tag_input.focus()
+            return
+
+        fields: list[Field] = []
+        for row in self.query(ComplexFieldRow):
+            field = row.to_field()
+            if not field.label and not field.value:
+                continue
+            if not field.label:
+                error.update("Every field needs a label.")
+                return
+            fields.append(field)
+
+        if not fields:
+            error.update("Add at least one field.")
+            return
+        if not any(field.secret for field in fields):
+            error.update("Mark at least one field as secret.")
+            return
+
+        self.dismiss(
+            Record(name=name, type=COMPLEX_TYPE, fields=tuple(fields), tag=tag, label=label)
+        )
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -382,7 +614,15 @@ class MainScreen(Screen):
 
         record = self._records[index]
         name_widget.update(f"[#8892b5]Name: [/]  {record.name}")
-        details: list[str] = []
+
+        if record.is_complex:
+            value_widget.update(self._complex_detail_text(record))
+            return
+
+        details: list[str] = [
+            f"[#8892b5]Tag:[/]  {record.tag}",
+            f"[#8892b5]Label:[/]  {record.label}",
+        ]
         if record.url:
             details.append(f"[#8892b5]URL:[/]  {record.url}")
         if record.login:
@@ -400,6 +640,27 @@ class MainScreen(Screen):
             details.append(f"[#8892b5]Secret:[/]  {'•' * 12}")
         value_widget.update("\n".join(details))
 
+    def _complex_detail_text(self, record: Record) -> str:
+        lines: list[str] = [
+            f"[#8892b5]Tag:[/]  {record.tag}",
+            f"[#8892b5]Label:[/]  {record.label}",
+        ]
+        for field in record.fields:
+            if not field.secret:
+                lines.append(f"[#8892b5]{field.label}:[/]  {field.value}")
+                continue
+            if not self._value_visible:
+                lines.append(f"[#8892b5]{field.label}:[/]  {'•' * 12}")
+                continue
+            try:
+                value = storage.decrypt_secret(self._master_password, field.value)
+            except InvalidToken:
+                self._value_visible = False
+                self.app.notify("Could not decrypt secret.", severity="error")
+                return self._complex_detail_text(record)
+            lines.append(f"[#8892b5]{field.label}:[/]  {value}")
+        return "\n".join(lines)
+
     def action_reveal_value(self) -> None:
         if self._selected_index is not None:
             self._value_visible = not self._value_visible
@@ -410,8 +671,13 @@ class MainScreen(Screen):
         if index is None or index >= len(self._records):
             return
 
+        token = self._primary_secret_token(self._records[index])
+        if token is None:
+            self.app.notify("No secret to copy.", severity="warning")
+            return
+
         try:
-            secret = storage.decrypt_secret(self._master_password, self._records[index].secret)
+            secret = storage.decrypt_secret(self._master_password, token)
         except InvalidToken:
             self.app.notify("Could not decrypt secret.", severity="error")
             return
@@ -420,6 +686,13 @@ class MainScreen(Screen):
             self.app.notify("Secret copied to system buffer.")
         else:
             self.app.notify("Could not copy secret to system buffer.", severity="error")
+
+    def _primary_secret_token(self, record: Record) -> str | None:
+        """The encrypted token copied to the buffer: first secret field for
+        complex records, the single secret for simple ones."""
+        if record.is_complex:
+            return next((field.value for field in record.fields if field.secret), None)
+        return record.secret or None
 
     def _copy_to_system_buffer(self, value: str) -> bool:
         self.app.copy_to_clipboard(value)
@@ -494,21 +767,76 @@ class MainScreen(Screen):
 
         record = self._records[index]
         try:
-            secret = storage.decrypt_secret(self._master_password, record.secret)
+            editable_record = self._decrypt_record(record)
         except InvalidToken:
             self.app.notify("Could not decrypt secret.", severity="error")
             return
 
-        editable_record = Record(
-            name=record.name,
-            type=record.type,
-            url=record.url,
-            login=record.login,
-            secret=secret,
-        )
         self.app.push_screen(
             AddRecordScreen(record=editable_record),
             callback=lambda updated: self._record_edited_at(index, updated),
+        )
+
+    def _decrypt_record(self, record: Record) -> Record:
+        """Return a copy with secret values decrypted, ready for editing."""
+        if record.is_complex:
+            return Record(
+                name=record.name,
+                type=record.type,
+                tag=record.tag,
+                label=record.label,
+                fields=tuple(
+                    Field(
+                        label=field.label,
+                        value=(
+                            storage.decrypt_secret(self._master_password, field.value)
+                            if field.secret
+                            else field.value
+                        ),
+                        secret=field.secret,
+                    )
+                    for field in record.fields
+                ),
+            )
+        return Record(
+            name=record.name,
+            type=record.type,
+            tag=record.tag,
+            label=record.label,
+            url=record.url,
+            login=record.login,
+            secret=storage.decrypt_secret(self._master_password, record.secret),
+        )
+
+    def _encrypt_record(self, record: Record) -> Record:
+        """Return a copy with secret values encrypted, ready for storage."""
+        if record.is_complex:
+            return Record(
+                name=record.name,
+                type=record.type,
+                tag=record.tag,
+                label=record.label,
+                fields=tuple(
+                    Field(
+                        label=field.label,
+                        value=(
+                            storage.encrypt_secret(self._master_password, field.value)
+                            if field.secret
+                            else field.value
+                        ),
+                        secret=field.secret,
+                    )
+                    for field in record.fields
+                ),
+            )
+        return Record(
+            name=record.name,
+            type=record.type,
+            tag=record.tag,
+            label=record.label,
+            url=record.url,
+            login=record.login,
+            secret=storage.encrypt_secret(self._master_password, record.secret),
         )
 
     def action_dump_records(self) -> None:
@@ -521,13 +849,7 @@ class MainScreen(Screen):
     def _record_added(self, record: Record | None) -> None:
         if record is None:
             return
-        encrypted_record = Record(
-            name=record.name,
-            type=record.type,
-            url=record.url,
-            login=record.login,
-            secret=storage.encrypt_secret(self._master_password, record.secret),
-        )
+        encrypted_record = self._encrypt_record(record)
         self._records.append(encrypted_record)
         list_view = self.query_one("#record-list", ListView)
         list_view.append(ListItem(Label(encrypted_record.name)))
@@ -544,13 +866,7 @@ class MainScreen(Screen):
         if record is None or index >= len(self._records):
             return
 
-        encrypted_record = Record(
-            name=record.name,
-            type=record.type,
-            url=record.url,
-            login=record.login,
-            secret=storage.encrypt_secret(self._master_password, record.secret),
-        )
+        encrypted_record = self._encrypt_record(record)
         self._records[index] = encrypted_record
 
         list_view = self.query_one("#record-list", ListView)
@@ -584,7 +900,7 @@ class SecretApp(App):
         cached_password = storage.load_session()
         if cached_password is not None:
             try:
-                records = [Record(**r) for r in storage.load_records(cached_password)]
+                records = [Record.from_payload(r) for r in storage.load_records(cached_password)]
             except InvalidToken:
                 storage.clear_session()
             else:

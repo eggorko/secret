@@ -15,9 +15,9 @@ VAULT_PATH = Path.home() / ".local" / "share" / "secret" / "vault.enc"
 SESSION_PATH = Path.home() / ".cache" / "secret" / "session.json"
 DEBUG_DUMP_PATH = Path.home() / ".cache" / "secret" / "records-debug.json"
 SESSION_TTL_S = 15 * 60
-VAULT_VERSION = 2
-RecordPayload = dict[str, str | None]
-LegacyRecordPayload = dict[str, str | None]
+VAULT_VERSION = 3
+RecordPayload = dict[str, object]
+LegacyRecordPayload = dict[str, object]
 
 
 def _derive_key(password: str, salt: bytes) -> bytes:
@@ -123,7 +123,9 @@ def _normalize_records_for_save(
 ) -> list[RecordPayload]:
     normalized_records: list[RecordPayload] = []
     for record in records:
-        if "secret" in record:
+        if record.get("type") == "ComplexCredentials":
+            normalized_records.append(_normalize_record(record))
+        elif "secret" in record:
             normalized_records.append(_normalize_record(record))
         elif isinstance(record.get("value"), str):
             normalized_records.append(_normalize_record({
@@ -134,9 +136,28 @@ def _normalize_records_for_save(
 
 
 def _normalize_record(record: RecordPayload) -> RecordPayload:
+    if record.get("type") == "ComplexCredentials":
+        raw_fields = record.get("fields") or []
+        return {
+            "name": record["name"],
+            "type": "ComplexCredentials",
+            "tag": record.get("tag") or "NULL",
+            "label": record.get("label") or "General",
+            "fields": [
+                {
+                    "label": field.get("label", ""),
+                    "value": field.get("value", ""),
+                    "secret": bool(field.get("secret", False)),
+                }
+                for field in raw_fields
+                if isinstance(field, dict)
+            ],
+        }
     return {
         "name": record["name"],
         "type": record.get("type") or "SimpleCredentials",
+        "tag": record.get("tag") or "NULL",
+        "label": record.get("label") or "General",
         "url": record.get("url") or None,
         "login": record.get("login") or None,
         "secret": record["secret"],
